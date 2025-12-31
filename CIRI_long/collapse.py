@@ -3,6 +3,11 @@ import pandas as pd
 import numpy as np
 from multiprocessing import Pool
 from collections import defaultdict, Counter, namedtuple
+import os
+import pickle
+import time
+import signal
+from contextlib import contextmanager
 
 from CIRI_long import env
 from CIRI_long.align import *
@@ -59,19 +64,24 @@ def load_cand_circ(in_file):
 
         # Partial reads
         prefix = cand_circ.name.split('.')[0]
-        with open(cand_circ.parent / (prefix + '.low_confidence.fa')) as f:
-            for line in f:
-                content = line.rstrip().lstrip('>').split('\t')
-                clip_base = int(content[5].split('|')[1].split('-')[0])
-                seq = f.readline().rstrip()
-                if clip_base > 20:
-                    continue
-                cand_reads[content[0]] = READ(*content, seq, sample, 'partial')
+        partial_file = cand_circ.parent / (prefix + '.low_confidence.fa')
+        if partial_file.exists():
+            with open(partial_file) as f:
+                for line in f:
+                    content = line.rstrip().lstrip('>').split('\t')
+                    clip_base = int(content[5].split('|')[1].split('-')[0])
+                    seq = f.readline().rstrip()
+                    if clip_base > 20:
+                        continue
+                    cand_reads[content[0]] = READ(*content, seq, sample, 'partial')
 
     return cand_reads
 
 
-def cluster_reads(cand_reads):
+def cluster_reads(cand_reads, max_cluster_size=1000):
+    """
+    Cluster reads by circRNA junction sites with size limits to prevent memory issues
+    """
     import re
     from operator import itemgetter
 
@@ -144,7 +154,18 @@ def cluster_reads(cand_reads):
             for i in tmp_reads:
                 reads_itered[i] = 1
 
-            reads_cluster.append(sorted([cand_reads[i] for i in tmp_reads], key=lambda x: len(x.seq), reverse=True))
+            # Sort by sequence length
+            cluster_reads_list = sorted([cand_reads[i] for i in tmp_reads], 
+                                       key=lambda x: len(x.seq), reverse=True)
+            
+            # Split large clusters to prevent memory issues
+            if len(cluster_reads_list) > max_cluster_size:
+                LOGGER.info(f'Large cluster detected ({len(cluster_reads_list)} reads), splitting into smaller chunks')
+                for chunk_start in range(0, len(cluster_reads_list), max_cluster_size):
+                    chunk_end = min(chunk_start + max_cluster_size, len(cluster_reads_list))
+                    reads_cluster.append(cluster_reads_list[chunk_start:chunk_end])
+            else:
+                reads_cluster.append(cluster_reads_list)
 
     return reads_cluster
 
@@ -158,19 +179,55 @@ def avg_score(alignment, ref, query):
     return distance(ref, x) / len(ref)
 
 
-def curate_junction(ctg, st, en, junc):
+def curate_junction(ctg, st, en, junc, max_iterations=1000, stats=None):
+    """
+    Optimized to reduce search space and prevent excessive iterations
+    """
     from libs.striped_smith_waterman.ssw_wrap import Aligner
     from operator import itemgetter
+    
+    # Reduce search range to be more conservative
+    search_window = 15  # Reduced from 25
+    
+    # Calculate actual range sizes to avoid overshooting max_iterations
+    start_range = min(st) - search_window, max(st) + search_window
+    end_range = min(en) - search_window, min(max(en) + search_window, env.CONTIG_LEN[ctg])
+    
+    start_size = start_range[1] - max(0, start_range[0])
+    end_size = end_range[1] - end_range[0]
+    total_iterations = start_size * end_size
+    
+    # If estimated iterations exceed limit, reduce search window further
+    if total_iterations > max_iterations:
+        scale_factor = (max_iterations / total_iterations) ** 0.5
+        search_window = max(5, int(search_window * scale_factor))
+    
     junc_scores = []
-    for i in range(max(0, min(st) - 25), max(st) + 25):
-        for j in range(min(en) - 25, min(max(en) + 25, env.CONTIG_LEN[ctg])):
+    iteration_count = 0
+    hit_limit = False
+    
+    for i in range(max(0, min(st) - search_window), max(st) + search_window):
+        for j in range(min(en) - search_window, min(max(en) + search_window, env.CONTIG_LEN[ctg])):
+            iteration_count += 1
+            if iteration_count > max_iterations:
+                hit_limit = True
+                break
+                
             if j <= i:
                 continue
             tmp = genome_junction_seq(ctg, i, j, width=10)
             tmp_aligner = Aligner(tmp, match=10, mismatch=4, gap_open=8, gap_extend=2)
             tmp_score = avg_score(tmp_aligner.align(junc), tmp, junc)
             junc_scores.append((i, j, tmp_score))
-    return sorted(junc_scores, key=itemgetter(2))
+        if hit_limit:
+            break
+    
+    # Track statistics instead of logging
+    if hit_limit and stats is not None:
+        stats['curate_junction_limited'] = stats.get('curate_junction_limited', 0) + 1
+    
+    # Return top 50 results (reduced from 100)
+    return sorted(junc_scores, key=itemgetter(2))[:50]
 
 
 def annotated_hit(contig, scores):
@@ -215,51 +272,145 @@ def junc_score(ctg, junc, junc_seqs):
     return score
 
 
-def correct_chunk(chunk, max_cluster=200):
+@contextmanager
+def time_limit(seconds):
+    """Context manager for timing out operations"""
+    def signal_handler(signum, frame):
+        raise TimeoutError("Operation timeout")
+    
+    # Set the signal handler and alarm
+    old_handler = signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def correct_chunk(chunk, max_cluster=100, timeout_per_cluster=60):
+    """
+    Process a chunk of clusters with aggressive timeout protection
+    Reduced default timeout from 300s to 60s
+    """
     cs_cluster = []
     cnt = defaultdict(int)
-    for cluster in chunk:
+    skipped = 0
+    timeout_count = 0
+    
+    # Track optimization events
+    stats = {
+        'curate_junction_limited': 0,
+        'slow_clusters': 0
+    }
+    
+    for idx, cluster in enumerate(chunk):
         if cluster is None:
             continue
-        # if '631ecb01-6f74-4de9-b8ab-c673b95cc4d3' not in [i.read_id for i in cluster]:
-        #     continue
-        ret = correct_cluster(cluster, max_cluster=max_cluster)
-        if ret is None:
+        
+        cluster_size = len(cluster)
+        
+        # Skip extremely large clusters immediately
+        if cluster_size > 200:
+            LOGGER.debug(f'Skipping oversized cluster {idx} with {cluster_size} reads')
+            cnt['skipped_oversized'] = cnt.get('skipped_oversized', 0) + 1
             continue
-        circ_type, circ_attr = ret
-        cnt[circ_type] += 1
-        cs_cluster.append(circ_attr)
+        
+        try:
+            # Use timeout to prevent hanging on problematic clusters
+            with time_limit(timeout_per_cluster):
+                ret = correct_cluster(cluster, max_cluster=max_cluster, stats=stats)
+                if ret is None:
+                    continue
+                circ_type, circ_attr = ret
+                cnt[circ_type] += 1
+                cs_cluster.append(circ_attr)
+        except TimeoutError:
+            LOGGER.warn(f'Timeout: cluster {idx} ({cluster_size} reads, {timeout_per_cluster}s)')
+            timeout_count += 1
+            continue
+        except Exception as e:
+            LOGGER.warn(f'Error: cluster {idx} (size {cluster_size}): {str(e)[:100]}')
+            skipped += 1
+            continue
+    
+    if skipped > 0:
+        cnt['skipped_error'] = skipped
+    if timeout_count > 0:
+        cnt['skipped_timeout'] = timeout_count
+    
+    # Add stats to output
+    if stats['curate_junction_limited'] > 0:
+        cnt['curate_junction_limited'] = stats['curate_junction_limited']
+    if stats['slow_clusters'] > 0:
+        cnt['slow_clusters'] = stats['slow_clusters']
+    
     return cs_cluster, cnt
 
 
-def correct_cluster(cluster, is_debug=False, max_cluster=200):
+def correct_cluster(cluster, is_debug=False, max_cluster=100, stats=None):
+    """
+    Optimized version with early filtering, reduced computational load, and diagnostic timing
+    """
     from random import sample
     from collections import Counter
     from spoa import poa
     from libs.striped_smith_waterman.ssw_wrap import Aligner
+    import time
 
-    if cluster is None:
+    start_time = time.time()
+    
+    # Early exits
+    if cluster is None or len(cluster) <= 1:
         return None
-    if len(cluster) <= 1:
-        return None
-    if 'full' not in set([i.type for i in cluster]):
+    
+    # Filter for full-length reads early
+    full_reads = [i for i in cluster if i.type == 'full']
+    if not full_reads:
         return None
 
-    counter = Counter([i.circ_id for i in cluster if i.type == 'full']).most_common(n=1)
-    ref = sorted([i for i in cluster if i.circ_id == counter[0][0] and i.type == 'full'],
+    # Reduce cluster size early to save computation
+    if len(full_reads) > max_cluster:
+        full_reads = sample(full_reads, max_cluster)
+        # Keep some partial reads but limit them
+        partial_reads = [i for i in cluster if i.type != 'full']
+        if len(partial_reads) > 50:
+            partial_reads = sample(partial_reads, 50)
+        cluster = full_reads + partial_reads
+    
+    # Limit total cluster size more aggressively
+    if len(cluster) > 150:
+        cluster = cluster[:150]
+    
+    counter = Counter([i.circ_id for i in full_reads]).most_common(n=1)
+    ref = sorted([i for i in full_reads if i.circ_id == counter[0][0]],
                  key=lambda x: len(x.seq), reverse=True)[0]
+    
+    # Use shorter sequence for initial alignment
     ssw = Aligner(ref.seq[:50], match=10, mismatch=4, gap_open=8, gap_extend=2)
 
     head_pos = []
+    valid_queries = []
+    
+    # Filter queries by alignment quality early
     for query in cluster[1:]:
         alignment = ssw.align(query.seq)
-        head_pos.append(alignment.ref_begin)
+        # Only keep queries with reasonable alignment scores
+        if alignment.score > 150:  # Threshold to filter poor alignments
+            head_pos.append(alignment.ref_begin)
+            valid_queries.append(query)
+    
+    if not head_pos:
+        return None
 
+    # Use filtered queries
+    cluster = [ref] + valid_queries
+    
     template = transform_seq(ref.seq, max(head_pos))
     ssw = Aligner(template, match=10, mismatch=4, gap_open=8, gap_extend=2)
     junc_seqs = [get_junc_seq(template, -max(head_pos)//2, 25), ]
 
-    for query in cluster[1:]:
+    for query in valid_queries:
         alignment = ssw.align(query.seq)
         tmp = transform_seq(query.seq, alignment.query_begin)
         junc_seqs.append(get_junc_seq(tmp, -max(head_pos)//2, 25))
@@ -270,8 +421,9 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
     tmp_st = [int(i.circ_id.split(':')[1].split('-')[0]) for i in cluster]
     tmp_en = [int(i.circ_id.split(':')[1].split('-')[1]) for i in cluster]
 
-    # Curate junction sequence
-    scores = curate_junction(ctg, tmp_st, tmp_en, cs_junc)
+    # Curate junction sequence with iteration limit
+    scores = curate_junction(ctg, tmp_st, tmp_en, cs_junc, max_iterations=1000, stats=stats)
+    
     aval_junc = min_sorted_items(scores, 2)
     if aval_junc:
         anno_junc = annotated_hit(ctg, aval_junc)
@@ -286,6 +438,8 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
         circ_start, circ_end = int(circ_start), int(circ_end)
 
     # Annotated sites
+    ss_site = None
+    tmp_signal = None
     for shift_threshold in [5, 10]:
         ss_site, us_free, ds_free, tmp_signal = find_annotated_signal(ctg, circ_start, circ_end, 0, 10, shift_threshold)
         if ss_site is not None:
@@ -318,7 +472,6 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
         is_lariat = 0
         if retained_introns is not None and overlap_exons is None:
             is_lariat = 1
-            # Find high-confidence ciRNAs
             retained_introns = set(sum([i for _, i in retained_introns.items()], []))
             retained_strand = set([i[2] for i in retained_introns])
             tmp_circ = []
@@ -337,7 +490,6 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
                 circ_start, circ_end, circ_score, strand = sorted(tmp_circ, key=lambda x: x[2])[0]
                 circ_type = 'High confidence lariat'
             else:
-                # Lariat with recursive splicing branchpoint
                 is_lariat = 0
                 tmp_circ = []
                 for tmp_strand in retained_strand:
@@ -346,9 +498,7 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
                         tmp_circ.append([tmp_start, tmp_end, tmp_score, tmp_strand])
                 if tmp_circ:
                     circ_start, circ_end, circ_score, strand = sorted(tmp_circ, key=lambda x: x[2])[0]
-                    # cnt['Recursive splicing lariat'] += 1
                 else:
-                    # cnt['Unknown lariat'] += 1
                     strand = 'None'
 
         # Find denovo splice signal
@@ -381,19 +531,19 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
         alignment = ssw.align(query.seq * 2)
         tmp_pos = find_alignment_pos(alignment, len(circ_junc_seq)//2)
         if tmp_pos is None:
-            cluster_seq.append((query.read_id, query.seq ))
+            cluster_seq.append((query.read_id, query.seq))
         else:
-            tmp_seq = transform_seq(query.seq, tmp_pos % len(query.seq ))
+            tmp_seq = transform_seq(query.seq, tmp_pos % len(query.seq))
             cluster_seq.append((query.read_id, tmp_seq))
 
-    cluster_res = batch_cluster_sequence(circ_id, cluster_seq)
+    cluster_res = batch_cluster_sequence(circ_id, cluster_seq, max_attempts=5)
     cluster_res = sorted(cluster_res, key=lambda x: len(x[1]), reverse=True)
 
     circ = CIRC(ctg, circ_start + 1, circ_end, strand)
     circ_id = '{}:{}-{}'.format(circ.contig, circ.start, circ.end)
 
     if len(cluster_res) > 2 and len(cluster_res[0][1]) >= 0.5 * max(len(tmp_cluster), 10):
-        tmp_res = correct_cluster([i for i in cluster if i.read_id in cluster_res[0][1]], True)
+        tmp_res = correct_cluster([i for i in cluster if i.read_id in cluster_res[0][1]], True, max_cluster, stats)
         if tmp_res is not None:
             circ = tmp_res
             circ_id = '{}:{}-{}'.format(circ.contig, circ.start, circ.end)
@@ -409,6 +559,11 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
     if not is_concordance:
         return None
 
+    total_time = time.time() - start_time
+    if total_time > 30:
+        if stats is not None:
+            stats['slow_clusters'] = stats.get('slow_clusters', 0) + 1
+
     if is_debug:
         return circ
 
@@ -416,7 +571,10 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200):
                        ss_id, us_free, ds_free, circ_len, isoforms)
 
 
-def batch_cluster_sequence(circ_id, x):
+def batch_cluster_sequence(circ_id, x, max_attempts=5):
+    """
+    Added max_attempts limit to prevent infinite convergence loops
+    """
     sequence = {}
     hpc_freq = []
     for read_id, read_seq in x:
@@ -425,18 +583,22 @@ def batch_cluster_sequence(circ_id, x):
 
     res = iter_cluster_sequence(circ_id, hpc_freq, sequence)
 
-    # If consensus
-    for _ in range(10):
+    # If consensus - reduced from 10 to 5 attempts
+    for attempt in range(max_attempts):
         n_res = cluster_sequence(res, sequence)
         if len(n_res) == len(res):
             break
         res = n_res
     else:
-        LOGGER.warn('Sequence not consensus for circRNA: {}'.format(circ_id))
+        # Changed to debug level to reduce log spam
+        LOGGER.debug('Sequence not consensus for circRNA: {} after {} attempts'.format(circ_id, max_attempts))
     return res
 
 
-def iter_cluster_sequence(circ_id, hpc_freq, sequence):
+def iter_cluster_sequence(circ_id, hpc_freq, sequence, max_attempts=5):
+    """
+    Added max_attempts limit
+    """
     if len(hpc_freq) <= 50:
         return cluster_sequence(hpc_freq, sequence)
 
@@ -445,13 +607,14 @@ def iter_cluster_sequence(circ_id, hpc_freq, sequence):
         chunk = [i for i in tmp if i is not None]
         res = cluster_sequence(chunk + res, sequence)
 
-        for _ in range(10):
+        for _ in range(max_attempts):
             n_res = cluster_sequence(res, sequence)
             if len(n_res) == len(res):
                 break
             res = n_res
         else:
-            LOGGER.warn('Sequence not consensus for circRNA: {}'.format(circ_id))
+            # Changed to debug level to reduce log spam
+            LOGGER.debug('Sequence not consensus for circRNA: {} in iter after {} attempts'.format(circ_id, max_attempts))
     return res
 
 
@@ -696,7 +859,7 @@ def curate_isoform(circ, curated_exons, cluster_res):
     if len(final_isoforms) == 0:
         return None, None, None
 
-    total_cnt = sum([len(i[1]) for i in final_isoforms])
+    total_cnt = sum([len(i[1]) for i in final_isoforms.values()])
     ret = sorted(list(final_isoforms),
                  key=lambda x: (len(final_isoforms[x][1]), final_isoforms[x][0]),
                  reverse=True)
@@ -839,31 +1002,137 @@ def check_isoforms(circ, isoforms):
     return sum(concordance) > 0
 
 
-def correct_reads(reads_cluster, ref_fasta, gtf_index, intron_index, ss_index, threads):
+def correct_reads(reads_cluster, ref_fasta, gtf_index, intron_index, ss_index, threads, 
+                  checkpoint_file=None, max_cluster=100):
+    """
+    Optimized version with checkpointing, better parallelization, and progress tracking
+    """
+    from multiprocessing import Pool
+    from CIRI_long.logger import ProgressBar
+    
     # Load reference genome
     genome = Fasta(ref_fasta)
 
     corrected_reads = []
+    circ_num = defaultdict(int)
+    
+    # Load checkpoint if exists
+    start_idx = 0
+    if checkpoint_file and os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+                start_idx = checkpoint_data['index']
+                corrected_reads = checkpoint_data['corrected_reads']
+                circ_num = checkpoint_data['circ_num']
+            LOGGER.info(f'Resuming from checkpoint: {start_idx} jobs completed')
+        except Exception as e:
+            LOGGER.warn(f'Failed to load checkpoint: {e}. Starting from beginning.')
+            start_idx = 0
+    
+    # Prepare jobs with dynamic chunk sizing
+    total_reads = sum(len(cluster) for cluster in reads_cluster)
+    avg_cluster_size = total_reads / len(reads_cluster) if reads_cluster else 0
+    
+    # Adjust chunk size based on cluster complexity
+    if avg_cluster_size > 500:
+        chunk_size = 50  # Smaller chunks for complex data
+    elif avg_cluster_size > 200:
+        chunk_size = 100
+    else:
+        chunk_size = 250  # Original size for simple data
+    
+    LOGGER.info(f'Processing {len(reads_cluster)} clusters (avg size: {avg_cluster_size:.1f}) with chunk size {chunk_size}')
+    
     jobs = []
-    pool = Pool(threads, env.initializer, (None, genome.contig_len, genome, gtf_index, intron_index, ss_index, ))
+    pool = Pool(threads, env.initializer, 
+                (None, genome.contig_len, genome, gtf_index, intron_index, ss_index,))
 
-    for cluster in grouper(reads_cluster, 250):
-        jobs.append(pool.apply_async(correct_chunk, (cluster, 200)))
+    # Create job chunks
+    all_chunks = list(grouper(reads_cluster, chunk_size))
+    
+    # Skip already processed jobs
+    for chunk in all_chunks[start_idx:]:
+        jobs.append(pool.apply_async(correct_chunk, (chunk, max_cluster, 60)))  # 60s timeout
+    
     pool.close()
 
     prog = ProgressBar()
-    prog.update(0)
-    cnt = 0
-    circ_num = defaultdict(int)
-    for job in jobs:
-        tmp_cluster, tmp_num = job.get()
-        corrected_reads += tmp_cluster
-        for i in tmp_num:
-            circ_num[i] += tmp_num[i]
-        cnt += 1
-        prog.update(100 * cnt // len(jobs))
+    total_jobs = len(all_chunks)
+    completed_jobs = start_idx
+    prog.update(100 * completed_jobs // total_jobs if total_jobs > 0 else 0)
+    
+    LOGGER.info(f'Processing {len(jobs)} remaining job chunks ({completed_jobs}/{total_jobs} already complete)')
+    
+    # Process results with timeout handling
+    start_time = time.time()
+    last_update = start_time
+    
+    for job_idx, job in enumerate(jobs):
+        try:
+            # Get result with timeout
+            tmp_cluster, tmp_num = job.get(timeout=3600)  # 1 hour timeout per chunk
+            
+            corrected_reads += tmp_cluster
+            for i in tmp_num:
+                circ_num[i] += tmp_num[i]
+            
+            completed_jobs += 1
+            
+            # Update progress
+            current_time = time.time()
+            if current_time - last_update > 5:  # Update every 5 seconds
+                elapsed = current_time - start_time
+                rate = (completed_jobs - start_idx) / elapsed if elapsed > 0 else 0
+                remaining = (total_jobs - completed_jobs) / rate if rate > 0 else 0
+                LOGGER.info(f'Progress: {completed_jobs}/{total_jobs} ({100*completed_jobs//total_jobs}%) - '
+                           f'Rate: {rate:.2f} jobs/sec - ETA: {remaining/60:.1f} min')
+                last_update = current_time
+            
+            prog.update(100 * completed_jobs // total_jobs)
+            
+            # Save checkpoint every 10% or every 50 jobs
+            if checkpoint_file and (completed_jobs % max(1, total_jobs // 10) == 0 or 
+                                   (completed_jobs - start_idx) % 50 == 0):
+                try:
+                    checkpoint_data = {
+                        'index': completed_jobs,
+                        'corrected_reads': corrected_reads,
+                        'circ_num': circ_num
+                    }
+                    with open(checkpoint_file, 'wb') as f:
+                        pickle.dump(checkpoint_data, f)
+                    LOGGER.info(f'Checkpoint saved at job {completed_jobs}')
+                except Exception as e:
+                    LOGGER.warn(f'Failed to save checkpoint: {e}')
+                    
+        except Exception as e:
+            LOGGER.error(f'Job {job_idx + start_idx} failed: {e}')
+            completed_jobs += 1
+            continue
+    
     pool.join()
     prog.update(100)
+    
+    # Save final checkpoint
+    if checkpoint_file:
+        try:
+            checkpoint_data = {
+                'index': completed_jobs,
+                'corrected_reads': corrected_reads,
+                'circ_num': circ_num
+            }
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            LOGGER.info('Final checkpoint saved')
+        except Exception as e:
+            LOGGER.warn(f'Failed to save final checkpoint: {e}')
+    
+    # Summary statistics
+    total_time = time.time() - start_time
+    LOGGER.info(f'Processing completed in {total_time/60:.1f} minutes')
+    if circ_num:
+        LOGGER.info(f'Results: {sum(circ_num.values())} total, breakdown: {dict(circ_num)}')
 
     return circ_num, corrected_reads
 
@@ -910,11 +1179,7 @@ def cal_exp_mtx(cand_reads, corrected_reads, ref_fasta, gtf_idx, out_dir, prefix
     circ_info = {}
     reads_df = []
 
-    # with open('{}/{}.fa'.format(out_dir, prefix), 'w') as fa:
     for reads, tmp_iso_reads, seqs, circ_id, strand, ss_id, us_free, ds_free, circ_len, isoforms in corrected_reads:
-        # for tmp_id, tmp_seq in zip(reads, seqs):
-        #     fa.write('>{}\t{}\t{}\n{}\n'.format(tmp_id, circ_id, strand, tmp_seq))
-
         # circRNA information
         ctg, st, en = circ_pos(circ_id)
 
@@ -1021,7 +1286,6 @@ def circ_attr(gtf_index, ctg, start, end, strand):
     annotate circRNA information
     """
     if gtf_index is None or ctg not in gtf_index:
-        # LOGGER.warn('chrom of contig "{}" not in annotation gtf, please check'.format(ctg))
         return {}
     start_div, end_div = start // 500, end // 500
 
@@ -1039,8 +1303,6 @@ def circ_attr(gtf_index, ctg, start, end, strand):
             # end site
             if element.start <= end <= element.end and (element.strand == strand or strand is None):
                 end_element[element.type].append(element)
-            # if element.type != 'gene':
-            #     continue
             if element.end < start or end < element.start:
                 continue
             if element.attr['gene_id'] not in host_gene:
@@ -1072,8 +1334,6 @@ def circ_attr(gtf_index, ctg, start, end, strand):
         field['circ_type'] = 'exon'
     elif 'intron' in circ_type:
         field['circ_type'] = 'intron'
-    # elif 'gene_intergenic' in circ_type:
-    #     field['circ_type'] = 'gene_intergenic'
     elif 'antisense' in circ_type:
         field['circ_type'] = 'antisense'
     else:

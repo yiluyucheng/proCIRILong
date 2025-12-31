@@ -109,7 +109,20 @@ def collapse(args):
     from CIRI_long.logger import get_logger
     from CIRI_long.utils import check_file, check_dir
     from CIRI_long.align import index_annotation, index_circ
-    from CIRI_long import collapse
+    
+    # Direct import to avoid caching issues
+    try:
+        from CIRI_long.collapse import (
+            load_cand_circ, cluster_reads, correct_reads, cal_exp_mtx
+        )
+    except ImportError:
+        # Fallback: reload the module
+        from CIRI_long import collapse
+        import importlib
+        importlib.reload(collapse)
+        from CIRI_long.collapse import (
+            load_cand_circ, cluster_reads, correct_reads, cal_exp_mtx
+        )
 
     if args.input is None or args.output is None:
         sys.exit('Please provide input and output file, run CIRI-long using -h or --help for detailed information.')
@@ -125,14 +138,19 @@ def collapse(args):
 
     threads = int(args.threads)
     debugging = args.debug
-    # is_canonical = args.canonical
     is_canonical = True
+    
+    # NEW: Optimization parameters
+    max_cluster = int(getattr(args, 'max_cluster', 100))
+    max_cluster_size = int(getattr(args, 'max_cluster_size', 1000))
 
     logger = get_logger('CIRI-long', fname='{}/{}.log'.format(out_dir, prefix), verbosity=debugging)
     logger.info('----------------- Input paramters ------------------')
     logger.info('Input reads: ' + os.path.basename(in_file))
     logger.info('Output directory: ' + os.path.basename(out_dir))
     logger.info('Multi threads: {}'.format(args.threads))
+    logger.info('Max cluster size: {}'.format(max_cluster))
+    logger.info('Max cluster size limit: {}'.format(max_cluster_size))
     logger.info('-------------- Collapse circular reads -------------')
 
     # generate index of splice site and annotation
@@ -157,45 +175,63 @@ def collapse(args):
                 pickle.dump([gtf_idx, intron_idx, ss_idx], idx, -1)
 
     # Load reads
-    cand_reads = collapse.load_cand_circ(in_file)
+    logger.info('Loading candidate circular reads')
+    cand_reads = load_cand_circ(in_file)
+    logger.info('Loaded {} candidate reads'.format(len(cand_reads)))
 
     # Consensus reads
     corrected_file = '{}/tmp/{}.corrected.pkl'.format(out_dir, prefix)
+    checkpoint_file = '{}/tmp/{}.checkpoint.pkl'.format(out_dir, prefix)
+    
     if not debugging and os.path.exists(corrected_file):
-        logger.info('Step 1 - Loading clustered circular reads in previous run')
+        logger.info('Step 1 - Loading clustered circular reads from previous run')
         with open(corrected_file, 'rb') as pkl:
             circ_num, corrected_reads = pickle.load(pkl)
     else:
         logger.info('Step 1 - Clustering candidate circular reads')
-        # Cluster reads
-        reads_cluster = collapse.cluster_reads(cand_reads)
+        # Cluster reads with size limit
+        reads_cluster = cluster_reads(cand_reads, max_cluster_size=max_cluster_size)
         logger.info('Circular reads clusters: {}'.format(len(reads_cluster)))
+        
+        # Log cluster size distribution
+        cluster_sizes = [len(c) for c in reads_cluster]
+        logger.info('Cluster size stats: min={}, max={}, avg={:.1f}, median={}'.format(
+            min(cluster_sizes) if cluster_sizes else 0,
+            max(cluster_sizes) if cluster_sizes else 0,
+            sum(cluster_sizes) / len(cluster_sizes) if cluster_sizes else 0,
+            sorted(cluster_sizes)[len(cluster_sizes)//2] if cluster_sizes else 0
+        ))
 
-        # Generate consensus reads
-        circ_num, corrected_reads = collapse.correct_reads(reads_cluster, ref_fasta, gtf_idx, intron_idx, ss_idx, threads)
+        # Generate consensus reads with checkpointing
+        circ_num, corrected_reads = correct_reads(
+            reads_cluster, ref_fasta, gtf_idx, intron_idx, ss_idx, threads,
+            checkpoint_file=checkpoint_file, max_cluster=max_cluster
+        )
+        
         with open(corrected_file, 'wb') as pkl:
             pickle.dump([circ_num, corrected_reads], pkl, -1)
-        logger.info('Corrected clusters: {}, {}/{}/{}/{} annotated/denovo/lariat/unknown'.format(
-            len(corrected_reads), circ_num['Annotated'], circ_num['Denovo signal'],
-            circ_num['High confidence lariat'], circ_num['Unknown signal']))
+        
+        # Clean up checkpoint file after successful completion
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            logger.info('Checkpoint file cleaned up')
+        
+        logger.info('Corrected clusters: {}'.format(len(corrected_reads)))
+        logger.info('Breakdown: {}/{}/{}/{} annotated/denovo/lariat/unknown'.format(
+            circ_num.get('Annotated', 0),
+            circ_num.get('Denovo signal', 0),
+            circ_num.get('High confidence lariat', 0),
+            circ_num.get('Unknown signal', 0)
+        ))
+        if 'skipped_timeout' in circ_num or 'skipped_error' in circ_num:
+            logger.warn('Skipped clusters: {} timeout, {} errors'.format(
+                circ_num.get('skipped_timeout', 0),
+                circ_num.get('skipped_error', 0)
+            ))
 
     logger.info('Step 2 - Calculating expression matrix')
-    circ_cnt, iso_cnt = collapse.cal_exp_mtx(cand_reads, corrected_reads, ref_fasta, gtf_idx, out_dir, prefix)
+    circ_cnt, iso_cnt = cal_exp_mtx(cand_reads, corrected_reads, ref_fasta, gtf_idx, out_dir, prefix)
     logger.info('Final circRNAs: {}, isoforms: {}'.format(circ_cnt, iso_cnt))
-
-    # # Find circRNAs again
-    # logger.info('Correct circRNAs from consensus reads!')
-    # corrected_circ, short_reads = scan_corrected_reads(corrected_reads, ref_fasta, ss_idx, threads)
-    #
-    # # Recover short circRNAs
-    # logger.info('Recover short circRNAs from consensus reads!')
-    # corrected_circ += recover_corrected_reads(short_reads, ref_fasta, ss_idx)
-    #
-    # logger.info('Clustered circRNAs: {}'.format(len(corrected_reads)))
-    # logger.info('Corrected circRNAs: {}'.format(len(corrected_circ)))
-    #
-    # with open('{}/{}_circ.pkl'.format(out_dir, prefix), 'wb') as idx:
-    #     pickle.dump(corrected_circ, idx, -1)
 
     logger.info('Correction of Back-Spliced Junctions finished!')
 
@@ -226,8 +262,6 @@ def main():
                              help='Genome reference gtf, (optional)', )
     call_parser.add_argument('-c', '--circ', dest='circ', metavar='CIRC', default=None,
                              help='Additional circRNA annotation in bed/gtf format, (optional)', )
-    # call_parser.add_argument('--canonical', dest='canonical', default=True, action='store_true',
-    #                          help='Use canonical splice signal (GT/AG) only, default: %(default)s)')
     call_parser.add_argument('-t', '--threads', dest='threads', metavar='INT', default=os.cpu_count(),
                              help='Number of threads, (default: use all cores)', )
     call_parser.add_argument('--debug', dest='debug', default=False, action='store_true',
@@ -248,10 +282,12 @@ def main():
                                  help='Genome reference gtf, (optional)', )
     collapse_parser.add_argument('-c', '--circ', dest='circ', metavar='CIRC', default=None,
                                  help='Additional circRNA annotation in bed/gtf format, (optional)', )
-    # collapse_parser.add_argument('--canonical', dest='canonical', default=False, action='store_true',
-    #                              help='Use canonical splice signal (GT/AG) only, default: %(default)s)')
     collapse_parser.add_argument('-t', '--threads', dest='threads', metavar='INT', default=os.cpu_count(),
                                  help='Number of threads, (default: use all cores)', )
+    collapse_parser.add_argument('--max-cluster', dest='max_cluster', metavar='INT', default=100, type=int,
+                                 help='Maximum reads per cluster to process, (default: %(default)s)', )
+    collapse_parser.add_argument('--max-cluster-size', dest='max_cluster_size', metavar='INT', default=1000, type=int,
+                                 help='Maximum cluster size before splitting, (default: %(default)s)', )
     collapse_parser.add_argument('--debug', dest='debug', default=False, action='store_true',
                                  help='Run in debugging mode, (default: %(default)s)', )
 

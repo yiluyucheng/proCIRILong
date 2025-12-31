@@ -30,23 +30,23 @@ def read(infile):
     return codecs.open(os.path.join(os.path.dirname(__file__), infile)).read()
 
 setup(
-    name='CIRI-long',
+    name='proCIRILong',
     python_requires='>3.7.0',
     version=__version__,
-    url='https://github.com/bioinfo-biols/CIRI-long',
+    url='https://github.com/yiluyucheng/proCIRILong',
     description='circular RNA identification from Nanopore',
     long_description=read('README.md'),
     long_description_content_type='text/markdown',
     author='Jinyang Zhang',
     author_email='zhangjinyang@biols.ac.cn',
-    maintainer='Jinyang Zhang',
-    maintainer_email='zhangjinyang@biols.ac.cn',
+    maintainer='Yucheng Wang',
+    maintainer_email='wangyucheng511@gmail.com',
     license='MIT',
     keywords='circRNA',
     packages=find_packages(exclude=['doc', 'tests']),
     entry_points={
         'console_scripts': [
-            'CIRI-long=CIRI_long.main:main',
+            'proCIRILong=CIRI_long.main:main',
         ]
     },
     include_package_data=True,
