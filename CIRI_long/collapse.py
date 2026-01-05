@@ -78,7 +78,7 @@ def load_cand_circ(in_file):
     return cand_reads
 
 
-def cluster_reads(cand_reads, max_cluster_size=1000):
+def cluster_reads(cand_reads, max_cluster_size=2000):
     """
     Cluster reads by circRNA junction sites with size limits to prevent memory issues
     """
@@ -187,7 +187,7 @@ def curate_junction(ctg, st, en, junc, max_iterations=1000, stats=None):
     from operator import itemgetter
     
     # Reduce search range to be more conservative
-    search_window = 15  # Reduced from 25
+    search_window = 25  # keep as 25
     
     # Calculate actual range sizes to avoid overshooting max_iterations
     start_range = min(st) - search_window, max(st) + search_window
@@ -536,7 +536,7 @@ def correct_cluster(cluster, is_debug=False, max_cluster=100, stats=None):
             tmp_seq = transform_seq(query.seq, tmp_pos % len(query.seq))
             cluster_seq.append((query.read_id, tmp_seq))
 
-    cluster_res = batch_cluster_sequence(circ_id, cluster_seq, max_attempts=5)
+    cluster_res = batch_cluster_sequence(circ_id, cluster_seq, max_attempts=10)
     cluster_res = sorted(cluster_res, key=lambda x: len(x[1]), reverse=True)
 
     circ = CIRC(ctg, circ_start + 1, circ_end, strand)
@@ -571,7 +571,7 @@ def correct_cluster(cluster, is_debug=False, max_cluster=100, stats=None):
                        ss_id, us_free, ds_free, circ_len, isoforms)
 
 
-def batch_cluster_sequence(circ_id, x, max_attempts=5):
+def batch_cluster_sequence(circ_id, x, max_attempts=10):
     """
     Added max_attempts limit to prevent infinite convergence loops
     """
@@ -583,7 +583,7 @@ def batch_cluster_sequence(circ_id, x, max_attempts=5):
 
     res = iter_cluster_sequence(circ_id, hpc_freq, sequence)
 
-    # If consensus - reduced from 10 to 5 attempts
+    # If consensus - keep as 10 attempts
     for attempt in range(max_attempts):
         n_res = cluster_sequence(res, sequence)
         if len(n_res) == len(res):
@@ -595,7 +595,7 @@ def batch_cluster_sequence(circ_id, x, max_attempts=5):
     return res
 
 
-def iter_cluster_sequence(circ_id, hpc_freq, sequence, max_attempts=5):
+def iter_cluster_sequence(circ_id, hpc_freq, sequence, max_attempts=10):
     """
     Added max_attempts limit
     """
