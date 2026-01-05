@@ -288,7 +288,7 @@ def time_limit(seconds):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def correct_chunk(chunk, max_cluster=100, timeout_per_cluster=60):
+def correct_chunk(chunk, max_cluster=200, timeout_per_cluster=60):
     """
     Process a chunk of clusters with aggressive timeout protection
     Reduced default timeout from 300s to 60s
@@ -310,11 +310,11 @@ def correct_chunk(chunk, max_cluster=100, timeout_per_cluster=60):
         
         cluster_size = len(cluster)
         
-        # Skip extremely large clusters immediately
-        if cluster_size > 200:
-            LOGGER.debug(f'Skipping oversized cluster {idx} with {cluster_size} reads')
-            cnt['skipped_oversized'] = cnt.get('skipped_oversized', 0) + 1
-            continue
+        # # Skip extremely large clusters immediately
+        # if cluster_size > 200:
+            # LOGGER.debug(f'Skipping oversized cluster {idx} with {cluster_size} reads')
+            # cnt['skipped_oversized'] = cnt.get('skipped_oversized', 0) + 1
+            # continue
         
         try:
             # Use timeout to prevent hanging on problematic clusters
@@ -348,7 +348,7 @@ def correct_chunk(chunk, max_cluster=100, timeout_per_cluster=60):
     return cs_cluster, cnt
 
 
-def correct_cluster(cluster, is_debug=False, max_cluster=100, stats=None):
+def correct_cluster(cluster, is_debug=False, max_cluster=200, stats=None):
     """
     Optimized version with early filtering, reduced computational load, and diagnostic timing
     """
@@ -373,14 +373,11 @@ def correct_cluster(cluster, is_debug=False, max_cluster=100, stats=None):
     if len(full_reads) > max_cluster:
         full_reads = sample(full_reads, max_cluster)
         # Keep some partial reads but limit them
-        partial_reads = [i for i in cluster if i.type != 'full']
-        if len(partial_reads) > 50:
-            partial_reads = sample(partial_reads, 50)
-        cluster = full_reads + partial_reads
+    partial_reads = [i for i in cluster if i.type != 'full']
+    if len(partial_reads) > max_partial_reads:
+    partial_reads = sample(partial_reads, int(len(partial_reads) / len(full_reads)) * max_cluster) ## ensure consistent proportion
+    cluster = full_reads + partial_reads
     
-    # Limit total cluster size more aggressively
-    if len(cluster) > 150:
-        cluster = cluster[:150]
     
     counter = Counter([i.circ_id for i in full_reads]).most_common(n=1)
     ref = sorted([i for i in full_reads if i.circ_id == counter[0][0]],

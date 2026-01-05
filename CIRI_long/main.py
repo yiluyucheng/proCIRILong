@@ -141,8 +141,8 @@ def collapse(args):
     is_canonical = True
     
     # NEW: Optimization parameters
-    max_cluster = int(getattr(args, 'max_cluster', 100))
-    max_cluster_size = int(getattr(args, 'max_cluster_size', 1000))
+    max_cluster = int(getattr(args, 'max_cluster', 200))
+    max_cluster_size = int(getattr(args, 'max_cluster_size', 2000))
 
     logger = get_logger('CIRI-long', fname='{}/{}.log'.format(out_dir, prefix), verbosity=debugging)
     logger.info('----------------- Input paramters ------------------')
@@ -284,9 +284,9 @@ def main():
                                  help='Additional circRNA annotation in bed/gtf format, (optional)', )
     collapse_parser.add_argument('-t', '--threads', dest='threads', metavar='INT', default=os.cpu_count(),
                                  help='Number of threads, (default: use all cores)', )
-    collapse_parser.add_argument('--max-cluster', dest='max_cluster', metavar='INT', default=100, type=int,
+    collapse_parser.add_argument('--max-cluster', dest='max_cluster', metavar='INT', default=200, type=int,
                                  help='Maximum reads per cluster to process, (default: %(default)s)', )
-    collapse_parser.add_argument('--max-cluster-size', dest='max_cluster_size', metavar='INT', default=1000, type=int,
+    collapse_parser.add_argument('--max-cluster-size', dest='max_cluster_size', metavar='INT', default=2000, type=int,
                                  help='Maximum cluster size before splitting, (default: %(default)s)', )
     collapse_parser.add_argument('--debug', dest='debug', default=False, action='store_true',
                                  help='Run in debugging mode, (default: %(default)s)', )
