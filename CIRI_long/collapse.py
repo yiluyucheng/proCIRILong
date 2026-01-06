@@ -369,14 +369,15 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200, stats=None):
     if not full_reads:
         return None
 
+    original_cluster = cluster[:]
     # Reduce cluster size early to save computation
     if len(full_reads) > max_cluster:
         full_reads = sample(full_reads, max_cluster)
         # Keep some partial reads but limit them
-    partial_reads = [i for i in cluster if i.type != 'full']
-    if len(partial_reads) > max_partial_reads:
-    partial_reads = sample(partial_reads, int(len(partial_reads) / len(full_reads)) * max_cluster) ## ensure consistent proportion
-    cluster = full_reads + partial_reads
+        partial_reads = [i for i in cluster if i.type != 'full']
+        # if len(partial_reads) > max_partial_reads:
+        partial_reads = sample(partial_reads, int(max_cluster / len(full_reads) * len(partial_reads))) ## ensure consistent proportion
+        cluster = full_reads + partial_reads
     
     
     counter = Counter([i.circ_id for i in full_reads]).most_common(n=1)
@@ -546,7 +547,7 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200, stats=None):
             circ_id = '{}:{}-{}'.format(circ.contig, circ.start, circ.end)
 
     # Filter out strange cirexons
-    curated_exons = curate_cirexons(circ, cluster)
+    curated_exons = curate_cirexons(circ, original_cluster)
     if curated_exons is None:
         return None
     isoforms, isoform_reads, circ_len = curate_isoform(circ, curated_exons, cluster_res)
@@ -564,7 +565,7 @@ def correct_cluster(cluster, is_debug=False, max_cluster=200, stats=None):
     if is_debug:
         return circ
 
-    return circ_type, ([i.read_id for i in cluster], isoform_reads, cluster_seq, circ_id, circ.strand,
+    return circ_type, ([i.read_id for i in original_cluster], isoform_reads, cluster_seq, circ_id, circ.strand,
                        ss_id, us_free, ds_free, circ_len, isoforms)
 
 
