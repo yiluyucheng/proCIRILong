@@ -288,10 +288,10 @@ def time_limit(seconds):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def correct_chunk(chunk, max_cluster=200, timeout_per_cluster=60):
+def correct_chunk(chunk, max_cluster=200, timeout_per_cluster=120):
     """
     Process a chunk of clusters with aggressive timeout protection
-    Reduced default timeout from 300s to 60s
+    Reduced default timeout from 300s to 120s
     """
     cs_cluster = []
     cnt = defaultdict(int)
@@ -1051,7 +1051,7 @@ def correct_reads(reads_cluster, ref_fasta, gtf_index, intron_index, ss_index, t
     
     # Skip already processed jobs
     for chunk in all_chunks[start_idx:]:
-        jobs.append(pool.apply_async(correct_chunk, (chunk, max_cluster, 60)))  # 60s timeout
+        jobs.append(pool.apply_async(correct_chunk, (chunk, max_cluster, 120)))  # 120s timeout
     
     pool.close()
 
